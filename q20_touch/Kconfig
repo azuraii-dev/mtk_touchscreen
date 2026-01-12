@@ -1,0 +1,12 @@
+#
+# q20 touchscreen driver configuration
+#
+config TOUCHSCREEN_Q20_TOUCH
+	tristate "q20 tp chip for Mediatek package"
+	default n
+	depends on I2C && OF
+	help
+	  Say Y here if you have gigadevice touch panel.
+	  If unsure, say N.
+	  To compile this dirver as a module, choose M here: the
+	  module will be called.
