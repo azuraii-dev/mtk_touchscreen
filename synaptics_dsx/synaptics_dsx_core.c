@@ -648,22 +648,21 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 					ABS_MT_PRESSURE, z);
 #endif
 
-			input_report_key(rmi4_data->input_dev,
-					BTN_TOUCH, 1);
-
-			input_sync(rmi4_data->input_dev);
-
 			touch_count++;
 		}
 	}
 
-	if (touch_count == 0) {
-		input_report_key(rmi4_data->input_dev,
-				BTN_TOUCH, 0);
-
+	/*
+	 * Sync once after processing all fingers to group events into single frame
+	 */
+	if (touch_count > 0) {
+		input_report_key(rmi4_data->input_dev, BTN_TOUCH, 1);
+	} else {
+		input_report_key(rmi4_data->input_dev, BTN_TOUCH, 0);
 		dev_dbg(rmi4_data->pdev->dev.parent, "%s: Touch UP\n", __func__);
-		input_sync(rmi4_data->input_dev);
 	}
+
+	input_sync(rmi4_data->input_dev);
 
 
 	mutex_unlock(&(rmi4_data->rmi4_report_mutex));
@@ -851,14 +850,10 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 					ABS_MT_PRESSURE, z);
 #endif
 
-			input_report_key(rmi4_data->input_dev,
-					BTN_TOUCH, 1);
-
-			input_sync(rmi4_data->input_dev);
-
 			touch_count++;
 			break;
 		case F12_PALM_STATUS:
+			/* Palm triggers a cancel event with its own sync - handled separately */
 			synaptics_rmi4_cancel_touch(rmi4_data, finger);
 			touch_count++;
 			rmi4_data->ignore_touch = true;
@@ -866,9 +861,8 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 				"Large object detected\n");
 			break;
 		default:
+			/* Finger lifted - just update the slot, we'll sync at the end */
 			input_mt_slot(rmi4_data->input_dev, finger);
-			input_report_key(rmi4_data->input_dev,
-					BTN_TOUCH, 0);
 			input_mt_report_slot_state(rmi4_data->input_dev,
 					MT_TOOL_FINGER, 0);
 			dev_dbg(rmi4_data->pdev->dev.parent,
@@ -878,15 +872,18 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		}
 	}
 
-	if (touch_count == 0) {
-		input_report_key(rmi4_data->input_dev,
-				BTN_TOUCH, 0);
-		input_report_key(rmi4_data->input_dev,
-				BTN_TOOL_FINGER, 0);
-
+	/*
+	 * Report BTN_TOUCH state and sync once for the whole batch to group events into single frame
+	 */
+	if (touch_count > 0) {
+		input_report_key(rmi4_data->input_dev, BTN_TOUCH, 1);
+	} else {
+		input_report_key(rmi4_data->input_dev, BTN_TOUCH, 0);
+		input_report_key(rmi4_data->input_dev, BTN_TOOL_FINGER, 0);
 		dev_dbg(rmi4_data->pdev->dev.parent, "%s: Touch UP\n", __func__);
-		input_sync(rmi4_data->input_dev);
 	}
+
+	input_sync(rmi4_data->input_dev);
 
 
 	mutex_unlock(&(rmi4_data->rmi4_report_mutex));
