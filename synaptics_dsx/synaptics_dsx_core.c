@@ -80,6 +80,15 @@ ctp {
 #define MAX_F11_TOUCH_WIDTH 15
 #define MAX_Z 255
 
+/*
+ * FUZZ: movements smaller than this are filtered out by the input layer
+ * FLAT: creates a dead zone around the touch point
+ *
+ * Tweak to change sensitivity. Higher values = more filtering, less jitter.
+ */
+#define TOUCH_POSITION_FUZZ 4
+#define TOUCH_POSITION_FLAT 4
+
 #define CHECK_STATUS_TIMEOUT_MS 100
 
 #define F01_STD_QUERY_LEN 21
@@ -2127,10 +2136,12 @@ static void synaptics_rmi4_set_params(struct synaptics_rmi4_data *rmi4_data)
 
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_POSITION_X, 0,
-			rmi4_data->sensor_max_x, 0, 0);
+			rmi4_data->sensor_max_x,
+			TOUCH_POSITION_FUZZ, TOUCH_POSITION_FLAT);
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_POSITION_Y, 0,
-			rmi4_data->sensor_max_y, 0, 0);
+			rmi4_data->sensor_max_y,
+			TOUCH_POSITION_FUZZ, TOUCH_POSITION_FLAT);
 #ifdef REPORT_2D_W
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_TOUCH_MAJOR, 0,
