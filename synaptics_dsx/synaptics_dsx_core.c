@@ -86,8 +86,8 @@ ctp {
  *
  * Tweak to change sensitivity. Higher values = more filtering, less jitter.
  */
-#define TOUCH_POSITION_FUZZ 4
-#define TOUCH_POSITION_FLAT 4
+#define TOUCH_POSITION_FUZZ 16
+#define TOUCH_POSITION_FLAT 16
 
 #define CHECK_STATUS_TIMEOUT_MS 100
 
