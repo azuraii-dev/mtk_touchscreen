@@ -120,7 +120,7 @@ MODULE_PARM_DESC(one_euro_beta,
 module_param(one_euro_d_cutoff, int, 0644);
 MODULE_PARM_DESC(one_euro_d_cutoff,
 	"One Euro filter derivative cutoff frequency (Hz * 1000). "
-	"Smooths velocity estimate. Default: 1000 (1.0 Hz)")
+	"Smooths velocity estimate. Default: 1000 (1.0 Hz)");
 
 #define CHECK_STATUS_TIMEOUT_MS 100
 
@@ -322,11 +322,13 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	 * Higher velocity -> higher cutoff -> less smoothing.
 	 * cutoff = min_cutoff + beta * |derivative|
 	 *
-	 * Both beta and derivative are scaled, so divide once to get scaled Hz.
+	 * Beta is scaled by FILTER_PRECISION_SCALE (e.g., 7000 = 7.0).
+	 * Derivative is in scaled-pixels-per-second (velocity * SCALE).
+	 * To get cutoff in scaled Hz, we must divide by SCALE^2.
 	 */
 	cutoff = one_euro_min_cutoff +
 		 (int)((s64)one_euro_beta * abs(state->derivative) /
-		       FILTER_PRECISION_SCALE);
+		       ((s64)FILTER_PRECISION_SCALE * FILTER_PRECISION_SCALE));
 
 	/* Apply low-pass filter to the position */
 	alpha = compute_alpha(cutoff, dt_ns);
