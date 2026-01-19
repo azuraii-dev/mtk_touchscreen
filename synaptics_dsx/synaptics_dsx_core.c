@@ -54,6 +54,7 @@ ctp {
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/regulator/consumer.h>
+#include <linux/ktime.h>
 #include "synaptics_dsx_core.h"
 #include <linux/input/mt.h>
 
@@ -81,13 +82,32 @@ ctp {
 #define MAX_Z 255
 
 /*
- * FUZZ: movements smaller than this are filtered out by the input layer
- * FLAT: creates a dead zone around the touch point
- * 16 seems to be a good compromise for both jitter and sensitivity.
- * Tweak to change sensitivity. Higher values = more filtering, less jitter.
+ * One Euro Filter configuration for touch position smoothing.
+ *
+ * This adaptive low-pass filter adjusts its cutoff frequency based on input
+ * velocity. When the finger moves slowly, the filter applies strong smoothing
+ * to eliminate jitter. When the finger moves quickly, the filter backs off
+ * to maintain responsiveness.
+ *
+ * Parameters (tuned for typical touch panel at ~100Hz report rate):
+ *   FILTER_PRECISION_SCALE: Fixed-point scale factor (1000 = 3 decimal places)
+ *   ONE_EURO_MIN_CUTOFF: Minimum cutoff frequency in Hz. Lower values provide
+ *                        stronger smoothing but increase latency.
+ *   ONE_EURO_BETA: Speed coefficient that controls how quickly the filter
+ *                  responds to fast movements. Higher values make the filter
+ *                  more responsive during quick gestures.
+ *   ONE_EURO_D_CUTOFF: Cutoff frequency for the derivative filter. This
+ *                      smooths the velocity estimate. Usually kept at 1.0 Hz.
+ *
+ * Reference: Casiez et al., "1 Euro Filter", CHI 2012
  */
-#define TOUCH_POSITION_FUZZ 16
-#define TOUCH_POSITION_FLAT 16
+#define FILTER_PRECISION_SCALE  1000
+#define ONE_EURO_MIN_CUTOFF     1000    /* 1.0 Hz - base cutoff frequency */
+#define ONE_EURO_BETA           7000    /* 7.0 - speed coefficient */
+#define ONE_EURO_D_CUTOFF       1000    /* 1.0 Hz - derivative filter cutoff */
+
+/* Pre-computed constant: 2 * PI * 1000 (scaled) for alpha calculation */
+#define TWO_PI_SCALED           6283
 
 #define CHECK_STATUS_TIMEOUT_MS 100
 
@@ -133,6 +153,185 @@ static ssize_t synaptics_rmi4_f01_flashprog_show(struct device *dev,
 
 static ssize_t synaptics_rmi4_suspend_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count);
+
+/*
+ * One Euro Filter Implementation
+ *
+ * The following functions implement an adaptive low-pass filter designed
+ * specifically for noisy human input signals like touch coordinates.
+ * The filter automatically adjusts its smoothing based on input velocity.
+ */
+
+/*
+ * Apply a simple low-pass filter using the given alpha value.
+ * Formula: output = alpha * new_value + (1 - alpha) * previous_value
+ *
+ * All values are scaled by FILTER_PRECISION_SCALE for fixed-point math.
+ * Returns the filtered value, still in scaled form.
+ */
+static int lowpass_filter(int alpha, int new_val, int prev_val)
+{
+	s64 result;
+
+	/*
+	 * Compute: alpha * new + (SCALE - alpha) * prev, then divide by SCALE.
+	 * Using s64 to prevent overflow during multiplication.
+	 */
+	result = (s64)alpha * new_val +
+		 (s64)(FILTER_PRECISION_SCALE - alpha) * prev_val;
+
+	return (int)(result / FILTER_PRECISION_SCALE);
+}
+
+/*
+ * Compute the filter coefficient (alpha) from a cutoff frequency.
+ * Based on the formula: alpha = 1 / (1 + tau / Te)
+ * where tau = 1 / (2 * PI * cutoff) and Te is the sample period.
+ *
+ * @cutoff_hz: Cutoff frequency in Hz (scaled by FILTER_PRECISION_SCALE)
+ * @dt_ns: Time delta since last sample in nanoseconds
+ *
+ * Returns alpha scaled by FILTER_PRECISION_SCALE (range 0 to SCALE).
+ */
+static int compute_alpha(int cutoff_hz, s64 dt_ns)
+{
+	s64 dt_scaled;
+	s64 tau_scaled;
+	s64 alpha;
+
+	/* Guard against division by zero or negative time delta */
+	if (dt_ns <= 0 || cutoff_hz <= 0)
+		return FILTER_PRECISION_SCALE; /* No filtering, pass through */
+
+	/*
+	 * Convert dt from nanoseconds to seconds (scaled).
+	 * dt_scaled = dt_ns * SCALE / 1e9
+	 */
+	dt_scaled = dt_ns * FILTER_PRECISION_SCALE / 1000000000LL;
+	if (dt_scaled <= 0)
+		dt_scaled = 1; /* Minimum 1 to avoid issues with very fast samples */
+
+	/*
+	 * tau = SCALE^2 / (TWO_PI_SCALED * cutoff_hz)
+	 * This is the time constant in scaled units.
+	 */
+	tau_scaled = (s64)FILTER_PRECISION_SCALE * FILTER_PRECISION_SCALE /
+		     ((s64)TWO_PI_SCALED * cutoff_hz / FILTER_PRECISION_SCALE);
+
+	/*
+	 * alpha = dt / (dt + tau) = dt * SCALE / (dt + tau)
+	 * Ensures alpha is in range [0, SCALE]
+	 */
+	alpha = dt_scaled * FILTER_PRECISION_SCALE / (dt_scaled + tau_scaled);
+
+	/* Clamp alpha to valid range */
+	if (alpha < 0)
+		alpha = 0;
+	if (alpha > FILTER_PRECISION_SCALE)
+		alpha = FILTER_PRECISION_SCALE;
+
+	return (int)alpha;
+}
+
+/*
+ * Apply One Euro filter to a single axis value.
+ *
+ * This is the main entry point for filtering touch coordinates. The filter
+ * maintains state between calls and automatically adjusts smoothing based
+ * on how fast the input is changing.
+ *
+ * @state: Per-axis filter state (must persist between calls)
+ * @raw_value: Raw coordinate value from the touch controller
+ * @timestamp_ns: Current timestamp in nanoseconds (from ktime_get_ns)
+ *
+ * Returns the filtered coordinate value.
+ */
+static int one_euro_filter(struct one_euro_filter_state *state,
+			   int raw_value, s64 timestamp_ns)
+{
+	s64 dt_ns;
+	int dx;
+	int dx_scaled;
+	int alpha_d;
+	int cutoff;
+	int alpha;
+	int raw_scaled;
+
+	/* First sample: initialize state and return raw value unchanged */
+	if (!state->initialized) {
+		state->filtered = raw_value * FILTER_PRECISION_SCALE;
+		state->derivative = 0;
+		state->timestamp_ns = timestamp_ns;
+		state->initialized = true;
+		return raw_value;
+	}
+
+	/* Calculate time delta since last sample */
+	dt_ns = timestamp_ns - state->timestamp_ns;
+	if (dt_ns <= 0) {
+		/*
+		 * Timestamp went backwards or no time elapsed.
+		 * Return last filtered value without updating state.
+		 */
+		return state->filtered / FILTER_PRECISION_SCALE;
+	}
+
+	/* Scale raw value for fixed-point arithmetic */
+	raw_scaled = raw_value * FILTER_PRECISION_SCALE;
+
+	/*
+	 * Estimate the derivative (rate of change).
+	 * dx = (current - previous) / dt, scaled appropriately.
+	 */
+	dx = raw_scaled - state->filtered;
+
+	/*
+	 * Scale derivative by time: dx_per_second = dx * 1e9 / dt_ns
+	 * To avoid overflow, divide first then multiply.
+	 */
+	if (dt_ns > 1000000) {
+		/* dt > 1ms, safe to compute normally */
+		dx_scaled = (int)((s64)dx * 1000000000LL / dt_ns);
+	} else {
+		/* Very small dt, limit the derivative magnitude */
+		dx_scaled = dx * 1000;
+	}
+
+	/*
+	 * Apply low-pass filter to the derivative estimate.
+	 * This smooths the velocity signal used for adaptive cutoff.
+	 */
+	alpha_d = compute_alpha(ONE_EURO_D_CUTOFF, dt_ns);
+	state->derivative = lowpass_filter(alpha_d, dx_scaled, state->derivative);
+
+	/*
+	 * Compute adaptive cutoff frequency.
+	 * Higher velocity -> higher cutoff -> less smoothing.
+	 * cutoff = min_cutoff + beta * |derivative|
+	 */
+	cutoff = ONE_EURO_MIN_CUTOFF +
+		 (int)((s64)ONE_EURO_BETA * abs(state->derivative) /
+		       FILTER_PRECISION_SCALE / FILTER_PRECISION_SCALE);
+
+	/* Apply low-pass filter to the position */
+	alpha = compute_alpha(cutoff, dt_ns);
+	state->filtered = lowpass_filter(alpha, raw_scaled, state->filtered);
+
+	/* Update timestamp for next iteration */
+	state->timestamp_ns = timestamp_ns;
+
+	/* Return filtered value, converting back from fixed-point */
+	return state->filtered / FILTER_PRECISION_SCALE;
+}
+
+/*
+ * Reset filter state for a finger.
+ * Called when a finger is lifted to ensure the next touch starts fresh.
+ */
+static void reset_finger_filter(struct finger_filter_state *filter)
+{
+	memset(filter, 0, sizeof(*filter));
+}
 
 struct synaptics_rmi4_f01_device_status {
 	union {
@@ -565,6 +764,7 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 	int wy;
 #endif
 	int temp;
+	s64 timestamp_ns;
 	struct synaptics_rmi4_f11_data_1_5 data;
 
 	/*
@@ -602,6 +802,11 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		input_mt_slot(rmi4_data->input_dev, finger);
 		input_mt_report_slot_state(rmi4_data->input_dev,
 				MT_TOOL_FINGER, finger_status != 0);
+
+		if (!finger_status) {
+			/* Finger lifted - reset filter state for next touch */
+			reset_finger_filter(&rmi4_data->finger_filter[finger]);
+		}
 
 		if (finger_status) {
 			data_offset = data_addr +
@@ -641,6 +846,14 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 				x = rmi4_data->sensor_max_x - x;
 			if (rmi4_data->hw_if->board_data->y_flip)
 				y = rmi4_data->sensor_max_y - y;
+
+			/* Apply One Euro filter to reduce jitter */
+			timestamp_ns = ktime_get_ns();
+			x = one_euro_filter(&rmi4_data->finger_filter[finger].x,
+					    x, timestamp_ns);
+			y = one_euro_filter(&rmi4_data->finger_filter[finger].y,
+					    y, timestamp_ns);
+
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_POSITION_X, x);
 			input_report_abs(rmi4_data->input_dev,
@@ -716,6 +929,7 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 	int wy;
 #endif
 	int temp;
+	s64 timestamp_ns;
 	struct synaptics_rmi4_f12_extra_data *extra_data;
 	struct synaptics_rmi4_f12_finger_data *data;
 
@@ -842,6 +1056,13 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 			if (rmi4_data->hw_if->board_data->y_flip)
 				y = rmi4_data->sensor_max_y - y;
 
+			/* Apply One Euro filter to reduce jitter */
+			timestamp_ns = ktime_get_ns();
+			x = one_euro_filter(&rmi4_data->finger_filter[finger].x,
+					    x, timestamp_ns);
+			y = one_euro_filter(&rmi4_data->finger_filter[finger].y,
+					    y, timestamp_ns);
+
 			dev_dbg(rmi4_data->pdev->dev.parent, "%s: finger=%d x=%d y=%d ma=%d mi=%d\n",
 					__func__, finger, x, y, max(wx, wy), min(wx, wy));
 			input_report_abs(rmi4_data->input_dev,
@@ -870,7 +1091,8 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 				"Large object detected\n");
 			break;
 		default:
-			/* Finger lifted - just update the slot, we'll sync at the end */
+			/* Finger lifted - reset filter and update the slot */
+			reset_finger_filter(&rmi4_data->finger_filter[finger]);
 			input_mt_slot(rmi4_data->input_dev, finger);
 			input_mt_report_slot_state(rmi4_data->input_dev,
 					MT_TOOL_FINGER, 0);
@@ -2134,14 +2356,19 @@ static void synaptics_rmi4_set_params(struct synaptics_rmi4_data *rmi4_data)
 				rmi4_data->max_touch_width, rmi4_data->max_touch_width,
 				rmi4_data->num_of_fingers);
 
+	/*
+	 * Set fuzz and flat to 0 since jitter filtering is now handled
+	 * by the One Euro filter in the driver instead of the input layer.
+	 */
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_POSITION_X, 0,
-			rmi4_data->sensor_max_x,
-			TOUCH_POSITION_FUZZ, TOUCH_POSITION_FLAT);
+			rmi4_data->sensor_max_x, 0, 0);
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_POSITION_Y, 0,
-			rmi4_data->sensor_max_y,
-			TOUCH_POSITION_FUZZ, TOUCH_POSITION_FLAT);
+			rmi4_data->sensor_max_y, 0, 0);
+
+	/* Initialize filter state for all fingers */
+	memset(rmi4_data->finger_filter, 0, sizeof(rmi4_data->finger_filter));
 #ifdef REPORT_2D_W
 	input_set_abs_params(rmi4_data->input_dev,
 			ABS_MT_TOUCH_MAJOR, 0,
@@ -2404,6 +2631,8 @@ static int synaptics_rmi4_free_fingers(struct synaptics_rmi4_data *rmi4_data)
 		input_mt_slot(rmi4_data->input_dev, ii);
 		input_mt_report_slot_state(rmi4_data->input_dev,
 				MT_TOOL_FINGER, 0);
+		/* Reset filter state for this finger */
+		reset_finger_filter(&rmi4_data->finger_filter[ii]);
 	}
 
 	input_report_key(rmi4_data->input_dev,
