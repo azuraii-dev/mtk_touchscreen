@@ -308,10 +308,12 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	 * Compute adaptive cutoff frequency.
 	 * Higher velocity -> higher cutoff -> less smoothing.
 	 * cutoff = min_cutoff + beta * |derivative|
+	 *
+	 * Both beta and derivative are scaled, so divide once to get scaled Hz.
 	 */
 	cutoff = ONE_EURO_MIN_CUTOFF +
 		 (int)((s64)ONE_EURO_BETA * abs(state->derivative) /
-		       FILTER_PRECISION_SCALE / FILTER_PRECISION_SCALE);
+		       FILTER_PRECISION_SCALE);
 
 	/* Apply low-pass filter to the position */
 	alpha = compute_alpha(cutoff, dt_ns);
