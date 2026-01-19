@@ -89,25 +89,38 @@ ctp {
  * to eliminate jitter. When the finger moves quickly, the filter backs off
  * to maintain responsiveness.
  *
- * Parameters (tuned for typical touch panel at ~100Hz report rate):
- *   FILTER_PRECISION_SCALE: Fixed-point scale factor (1000 = 3 decimal places)
- *   ONE_EURO_MIN_CUTOFF: Minimum cutoff frequency in Hz. Lower values provide
- *                        stronger smoothing but increase latency.
- *   ONE_EURO_BETA: Speed coefficient that controls how quickly the filter
- *                  responds to fast movements. Higher values make the filter
- *                  more responsive during quick gestures.
- *   ONE_EURO_D_CUTOFF: Cutoff frequency for the derivative filter. This
- *                      smooths the velocity estimate. Usually kept at 1.0 Hz.
+ * Parameters are tunable at runtime via /sys/module/synaptics_dsx/parameters/
+ * All frequency values are in Hz multiplied by 1000 (e.g., 1000 = 1.0 Hz).
  *
  * Reference: Casiez et al., "1 Euro Filter", CHI 2012
  */
 #define FILTER_PRECISION_SCALE  1000
-#define ONE_EURO_MIN_CUTOFF     1000    /* 1.0 Hz - base cutoff frequency */
-#define ONE_EURO_BETA           7000    /* 7.0 - speed coefficient */
-#define ONE_EURO_D_CUTOFF       1000    /* 1.0 Hz - derivative filter cutoff */
 
 /* Pre-computed constant: 2 * PI * 1000 (scaled) for alpha calculation */
 #define TWO_PI_SCALED           6283
+
+/*
+ * Tunable filter parameters with defaults for typical touch panels.
+ * Adjust via sysfs if touch feels too jittery or too laggy.
+ */
+static int one_euro_min_cutoff = 1000;	/* 1.0 Hz - base cutoff frequency */
+static int one_euro_beta = 7000;	/* 7.0 - speed coefficient */
+static int one_euro_d_cutoff = 1000;	/* 1.0 Hz - derivative filter cutoff */
+
+module_param(one_euro_min_cutoff, int, 0644);
+MODULE_PARM_DESC(one_euro_min_cutoff,
+	"One Euro filter minimum cutoff frequency (Hz * 1000). "
+	"Lower values = stronger smoothing but more latency. Default: 1000 (1.0 Hz)");
+
+module_param(one_euro_beta, int, 0644);
+MODULE_PARM_DESC(one_euro_beta,
+	"One Euro filter speed coefficient (* 1000). "
+	"Higher values = more responsive to fast movement. Default: 7000 (7.0)");
+
+module_param(one_euro_d_cutoff, int, 0644);
+MODULE_PARM_DESC(one_euro_d_cutoff,
+	"One Euro filter derivative cutoff frequency (Hz * 1000). "
+	"Smooths velocity estimate. Default: 1000 (1.0 Hz)")
 
 #define CHECK_STATUS_TIMEOUT_MS 100
 
@@ -301,7 +314,7 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	 * Apply low-pass filter to the derivative estimate.
 	 * This smooths the velocity signal used for adaptive cutoff.
 	 */
-	alpha_d = compute_alpha(ONE_EURO_D_CUTOFF, dt_ns);
+	alpha_d = compute_alpha(one_euro_d_cutoff, dt_ns);
 	state->derivative = lowpass_filter(alpha_d, dx_scaled, state->derivative);
 
 	/*
@@ -311,8 +324,8 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	 *
 	 * Both beta and derivative are scaled, so divide once to get scaled Hz.
 	 */
-	cutoff = ONE_EURO_MIN_CUTOFF +
-		 (int)((s64)ONE_EURO_BETA * abs(state->derivative) /
+	cutoff = one_euro_min_cutoff +
+		 (int)((s64)one_euro_beta * abs(state->derivative) /
 		       FILTER_PRECISION_SCALE);
 
 	/* Apply low-pass filter to the position */
