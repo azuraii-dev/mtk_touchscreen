@@ -104,8 +104,8 @@ ctp {
  * Adjust via sysfs if touch feels too jittery or too laggy.
  */
 static int one_euro_min_cutoff = 1000;	/* 1.0 Hz - base cutoff frequency */
-static int one_euro_beta = 1000;	/* 7.0 - speed coefficient */
-static int one_euro_d_cutoff = 50;	/* 1.0 Hz - derivative filter cutoff */
+static int one_euro_beta = 7000;	/* 7.0 - speed coefficient */
+static int one_euro_d_cutoff = 1000;	/* 1.0 Hz - derivative filter cutoff */
 static int one_euro_deadzone = 1000;	/* 1.0 pixel - deadzone threshold */
 
 module_param(one_euro_min_cutoff, int, 0644);
