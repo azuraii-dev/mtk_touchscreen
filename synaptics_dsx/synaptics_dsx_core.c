@@ -104,8 +104,9 @@ ctp {
  * Adjust via sysfs if touch feels too jittery or too laggy.
  */
 static int one_euro_min_cutoff = 1000;	/* 1.0 Hz - base cutoff frequency */
-static int one_euro_beta = 7000;	/* 7.0 - speed coefficient */
-static int one_euro_d_cutoff = 1000;	/* 1.0 Hz - derivative filter cutoff */
+static int one_euro_beta = 1000;	/* 7.0 - speed coefficient */
+static int one_euro_d_cutoff = 50;	/* 1.0 Hz - derivative filter cutoff */
+static int one_euro_deadzone = 1000;	/* 1.0 pixel - deadzone threshold */
 
 module_param(one_euro_min_cutoff, int, 0644);
 MODULE_PARM_DESC(one_euro_min_cutoff,
@@ -121,6 +122,11 @@ module_param(one_euro_d_cutoff, int, 0644);
 MODULE_PARM_DESC(one_euro_d_cutoff,
 	"One Euro filter derivative cutoff frequency (Hz * 1000). "
 	"Smooths velocity estimate. Default: 1000 (1.0 Hz)");
+
+module_param(one_euro_deadzone, int, 0644);
+MODULE_PARM_DESC(one_euro_deadzone,
+	"Deadzone threshold in sub-pixels (* 1000). Movements smaller than this "
+	"are suppressed when stationary. 0 = disabled. Default: 1000 (1.0 pixel)");
 
 #define CHECK_STATUS_TIMEOUT_MS 100
 
@@ -269,12 +275,15 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	int cutoff;
 	int alpha;
 	int raw_scaled;
+	int filtered_output;
+	int movement;
 
 	/* First sample: initialize state and return raw value unchanged */
 	if (!state->initialized) {
 		state->filtered = raw_value * FILTER_PRECISION_SCALE;
 		state->derivative = 0;
 		state->timestamp_ns = timestamp_ns;
+		state->last_reported = raw_value;
 		state->initialized = true;
 		return raw_value;
 	}
@@ -284,9 +293,9 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	if (dt_ns <= 0) {
 		/*
 		 * Timestamp went backwards or no time elapsed.
-		 * Return last filtered value without updating state.
+		 * Return last reported value without updating state.
 		 */
-		return state->filtered / FILTER_PRECISION_SCALE;
+		return state->last_reported;
 	}
 
 	/* Scale raw value for fixed-point arithmetic */
@@ -337,8 +346,22 @@ static int one_euro_filter(struct one_euro_filter_state *state,
 	/* Update timestamp for next iteration */
 	state->timestamp_ns = timestamp_ns;
 
-	/* Return filtered value, converting back from fixed-point */
-	return state->filtered / FILTER_PRECISION_SCALE;
+	/* Convert filtered value back from fixed-point */
+	filtered_output = state->filtered / FILTER_PRECISION_SCALE;
+
+	/*
+	 * Apply deadzone: suppress small movements when nearly stationary.
+	 */
+	if (one_euro_deadzone > 0) {
+		movement = abs(filtered_output - state->last_reported) *
+			   FILTER_PRECISION_SCALE;
+		if (movement < one_euro_deadzone)
+			return state->last_reported;
+	}
+
+	/* Movement exceeds deadzone (or deadzone disabled), update and report */
+	state->last_reported = filtered_output;
+	return filtered_output;
 }
 
 /*

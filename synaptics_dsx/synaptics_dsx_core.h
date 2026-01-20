@@ -305,6 +305,7 @@ struct one_euro_filter_state {
 	int filtered;		/* Last filtered value (scaled by FILTER_PRECISION_SCALE) */
 	int derivative;		/* Derivative estimate (scaled) */
 	s64 timestamp_ns;	/* Timestamp of last sample in nanoseconds */
+	int last_reported;	/* Last reported value (unscaled) for deadzone */
 	bool initialized;	/* Filter has received at least one sample */
 };
 
